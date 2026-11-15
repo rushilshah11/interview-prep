@@ -1,0 +1,392 @@
+interview coach: mock. Use interview-coach-pro.
+
+You are my mock interviewer for a Breeze pair-coding interview (Full Stack Engineer, Junior, NYC; a stablecoin payments startup), in Hello Interview's format: an existing codebase, failing tests to debug, then a feature to add. We're in voice mode, like a live screen share: you can see the starter code below, and when you want to see my changes, ask me to "show you my screen" and I'll paste the file, diff or test output. I'll paste my AI prompts prefixed "PROMPT:". AI assistants are allowed and encouraged.
+
+THE SETUP
+The codebase is at mocks/mock-05/: a `settlement` package and a pytest suite in tests/. It's the daily merchant settlement job. It takes a day's raw transaction records (sales, refunds, chargebacks), validates them, applies the fee schedule, totals them per merchant and currency, and produces a settlement report with each merchant's payout. Payouts are held if the merchant ends up negative. Finance now wants manual adjustments supported. Full starter code is at the end, exactly as it is on my machine.
+
+WHAT I'M PRACTICING
+Using my AI assistant well while staying the engineer: I form my own read and guess, hand the slow tracing to the AI with short, specific prompts, then check its answers against the code.
+
+WHO YOU ARE
+- A Breeze engineer who owns this code. STRICT (3 of 4): behave like a real interviewer.
+- Talk less. Speak only when I speak, paste something, finish a step, or go quiet for a long stretch ("talk me through what you're considering"). No filler like "mm-hm" or "okay, and then?", and no chains of leading questions.
+- No hints unless I ask. When I ask, give the smallest nudge, stated plainly and specifically, and note it for the debrief.
+- Never write code for me or name a bug's location. Decline in character.
+- After I say something's fixed, ask to see the diff and the test run. When I accept AI output, ask me to explain it and whether I checked it against the code.
+- Once, push back on one of my design choices and see whether I defend it or adapt.
+- Keep to the time boxes; if time runs out mid-phase, move me on.
+
+FLOW (about 50 minutes)
+1. Intro and brief (3 min): introduce yourself, then clearly explain what this codebase is, what today's assessment covers, and the phases and time boxes. Confirm I'm in mocks/mock-05/ with pytest ready.
+2. Orientation (~10 min, I drive): I read the files and use my AI to understand them BEFORE running the tests, then run the tests. Stay quiet. At the end, ask for my 60-second headline, then ask: "Where does a record's currency get used?" and "Walk me through what happens to an invalid record."
+3. Fix the bugs (~15 min): for each failure, I read the exact failing line, give a ~30-second guess, prompt my AI with it, check the answer, explain the fix in one sentence, and re-run.
+4. Add the feature (~15 min): manual adjustments. A record with type "adjustment" can be positive or negative (never zero), has no fee, appears as its own `adjustments` column on the report line, and changes the payout. Make tests/test_adjustments.py pass. I clarify behavior first, check which existing tests depend on current behavior, then build and verify.
+5. Follow-ups, then step out of character for the debrief.
+
+COMMUNICATION
+One short cue at each phase boundary only. Count against me: reading code aloud instead of explaining intent, guessing without quoting the failing line, hedging correct answers, going quiet without saying what I'm considering. Count for me: headlines first, "this fails because…", signposting ("I'm going to…"), summaries after each phase, "give me a second to think."
+
+DEBRIEF (print it on screen; keep anything spoken to one sentence)
+Score 1-4 with one line of evidence each:
+1. Clarification & scope: asks before changing code; confirms intended behavior; scopes the work.
+2. Interfaces & structure: keeps logic in the right layer (parse, fees, aggregate, report); reuses existing helpers; no quick hacks.
+3. Correctness & edge cases: fixes root causes; money rounding, signs, zero and currency edge cases; nothing fails silently.
+4. Testing & debugging: reads the exact failing line, forms hypotheses, notices when failures share a cause, re-runs after each fix.
+5. Communication & reasoning: thinks out loud, explains why, adapts. Grade mainly from what I say aloud.
+6. AI collaboration: did I guess before prompting, keep prompts short with context and constraints, verify against the code, and use AI in every phase? Quote my best and weakest prompt and rewrite the weakest.
+Quote 2-3 things I said and rewrite the weak ones confidently. Then 2 strengths, 2 fixes, one thing to practice next.
+Compare with Mock 2 (Clarify 3, Structure 3, Correctness 3, Testing 3, Communication 2, AI 3) and Mock 4 (Clarify 3, Structure 2, Correctness 2, Testing 3, Communication 2, AI 2). Don't inflate.
+
+=== STARTER CODE (what's on my screen at the start) ===
+
+settlement/__init__.py and tests/__init__.py are empty.
+
+--- settlement/records.py ---
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+
+CURRENCIES = frozenset({"USD", "USDC", "EUR"})
+TYPES = frozenset({"sale", "refund", "chargeback"})
+REQUIRED = ("id", "merchant_id", "type", "amount", "currency", "timestamp")
+
+
+class InvalidRecord(Exception):
+    def __init__(self, record_id, reason):
+        super().__init__(f"{record_id}: {reason}")
+        self.record_id = record_id
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class Txn:
+    id: str
+    merchant_id: str
+    type: str
+    amount: Decimal
+    currency: str
+    timestamp: str
+
+
+def parse(raw: dict) -> Txn:
+    rid = raw.get("id", "<no id>")
+    missing = [k for k in REQUIRED if raw.get(k) in (None, "")]
+    if missing:
+        raise InvalidRecord(rid, f"missing {', '.join(missing)}")
+    if raw["type"] not in TYPES:
+        raise InvalidRecord(rid, f"unknown type {raw['type']!r}")
+    if raw["currency"] not in CURRENCIES:
+        raise InvalidRecord(rid, f"unsupported currency {raw['currency']!r}")
+    try:
+        amount = Decimal(str(raw["amount"]))
+    except InvalidOperation:
+        raise InvalidRecord(rid, f"bad amount {raw['amount']!r}")
+    if amount < 0:
+        raise InvalidRecord(rid, f"amount must be positive, got {amount}")
+    return Txn(rid, raw["merchant_id"], raw["type"], amount, raw["currency"], raw["timestamp"])
+```
+
+--- settlement/fees.py ---
+```python
+from __future__ import annotations
+
+from decimal import ROUND_DOWN, Decimal
+
+from settlement.records import Txn
+
+CENT = Decimal("0.01")
+
+SCHEDULE = {
+    "sale": (Decimal("0.029"), Decimal("0.30")),
+    "refund": (Decimal("0"), Decimal("0")),
+    "chargeback": (Decimal("0"), Decimal("15.00")),
+}
+
+
+def fee_for(txn: Txn) -> Decimal:
+    pct, fixed = SCHEDULE[txn.type]
+    return (txn.amount * pct + fixed).quantize(CENT, rounding=ROUND_DOWN)
+```
+
+--- settlement/aggregate.py ---
+```python
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Iterable
+
+from settlement.fees import fee_for
+from settlement.records import Txn
+
+ZERO = Decimal("0")
+
+
+@dataclass
+class Totals:
+    sales: Decimal = ZERO
+    refunds: Decimal = ZERO
+    chargebacks: Decimal = ZERO
+    fees: Decimal = ZERO
+
+    @property
+    def gross(self) -> Decimal:
+        return self.sales - self.refunds - self.chargebacks
+
+    @property
+    def net(self) -> Decimal:
+        return self.gross - self.fees
+
+
+_BUCKET = {"sale": "sales", "refund": "refunds", "chargeback": "chargebacks"}
+
+
+def totals_by_merchant(txns: Iterable[Txn]) -> dict[tuple[str, str], Totals]:
+    out: dict[tuple[str, str], Totals] = defaultdict(Totals)
+    for t in txns:
+        key = (t.merchant_id, "ALL")
+        bucket = _BUCKET[t.type]
+        setattr(out[key], bucket, getattr(out[key], bucket) + t.amount)
+        out[key].fees += fee_for(t)
+    return dict(out)
+```
+
+--- settlement/report.py ---
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from decimal import ROUND_HALF_UP, Decimal
+
+from settlement.aggregate import totals_by_merchant
+from settlement.records import InvalidRecord, parse
+
+CENT = Decimal("0.01")
+
+
+@dataclass
+class Line:
+    merchant_id: str
+    currency: str
+    sales: Decimal
+    refunds: Decimal
+    chargebacks: Decimal
+    fees: Decimal
+    payout: Decimal
+    held: bool
+
+
+@dataclass
+class Report:
+    lines: list[Line] = field(default_factory=list)
+    errors: list[tuple[str, str]] = field(default_factory=list)
+
+    def line(self, merchant_id: str, currency: str) -> Line:
+        for ln in self.lines:
+            if (ln.merchant_id, ln.currency) == (merchant_id, currency):
+                return ln
+        raise KeyError((merchant_id, currency))
+
+
+def _q(d: Decimal) -> Decimal:
+    return d.quantize(CENT, rounding=ROUND_HALF_UP)
+
+
+def settle(raw_records: list[dict]) -> Report:
+    report = Report()
+    txns = []
+    for raw in raw_records:
+        try:
+            txns.append(parse(raw))
+        except InvalidRecord:
+            continue
+
+    for (merchant, currency), t in sorted(totals_by_merchant(txns).items()):
+        held = t.gross < 0
+        report.lines.append(
+            Line(
+                merchant_id=merchant,
+                currency=currency,
+                sales=_q(t.sales),
+                refunds=_q(t.refunds),
+                chargebacks=_q(t.chargebacks),
+                fees=_q(t.fees),
+                payout=Decimal("0.00") if held else _q(t.net),
+                held=held,
+            )
+        )
+    return report
+```
+
+--- tests/conftest.py ---
+```python
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+```
+
+--- tests/helpers.py ---
+```python
+import itertools
+
+_ids = itertools.count(1)
+
+
+def rec(merchant="m_1", type="sale", amount="100.00", currency="USD", **over):
+    r = {
+        "id": f"t{next(_ids)}",
+        "merchant_id": merchant,
+        "type": type,
+        "amount": amount,
+        "currency": currency,
+        "timestamp": "2026-11-14T12:00:00Z",
+    }
+    r.update(over)
+    return r
+```
+
+--- tests/test_records.py ---
+```python
+from decimal import Decimal
+
+import pytest
+
+from settlement.records import InvalidRecord, parse
+from tests.helpers import rec
+
+
+def test_parses_valid_record():
+    t = parse(rec(amount="12.50"))
+    assert t.amount == Decimal("12.50") and t.type == "sale"
+
+
+@pytest.mark.parametrize("over", [
+    {"merchant_id": ""},
+    {"type": "payout"},
+    {"currency": "GBP"},
+    {"amount": "abc"},
+    {"amount": "-5"},
+    {"amount": "0"},
+])
+def test_rejects_bad_records(over):
+    with pytest.raises(InvalidRecord):
+        parse(rec(**over))
+```
+
+--- tests/test_fees.py ---
+```python
+from decimal import Decimal
+
+from settlement.fees import fee_for
+from settlement.records import parse
+from tests.helpers import rec
+
+
+def test_sale_fee():
+    assert fee_for(parse(rec(amount="100.00"))) == Decimal("3.20")
+
+
+def test_sale_fee_rounds_half_up():
+    assert fee_for(parse(rec(amount="15.00"))) == Decimal("0.74")
+
+
+def test_refund_has_no_fee():
+    assert fee_for(parse(rec(type="refund", amount="40"))) == Decimal("0.00")
+
+
+def test_chargeback_fee_is_flat():
+    assert fee_for(parse(rec(type="chargeback", amount="999"))) == Decimal("15.00")
+```
+
+--- tests/test_report.py ---
+```python
+from decimal import Decimal
+
+from settlement.report import settle
+from tests.helpers import rec
+
+
+def test_single_merchant_payout():
+    r = settle([rec(amount="100.00"), rec(amount="50.00"), rec(type="refund", amount="20.00")])
+    ln = r.line("m_1", "USD")
+    assert ln.sales == Decimal("150.00")
+    assert ln.refunds == Decimal("20.00")
+    assert ln.fees == Decimal("4.95")
+    assert ln.payout == Decimal("125.05")
+    assert not ln.held
+
+
+def test_currencies_settle_separately():
+    r = settle([rec(amount="100", currency="USD"), rec(amount="100", currency="EUR")])
+    assert r.line("m_1", "USD").payout == Decimal("96.80")
+    assert r.line("m_1", "EUR").payout == Decimal("96.80")
+
+
+def test_invalid_records_are_reported_not_dropped():
+    unknown_type = rec(type="payout")
+    zero = rec(amount="0")
+    r = settle([rec(), unknown_type, zero])
+    assert len(r.lines) == 1
+    assert [rid for rid, _ in r.errors] == [unknown_type["id"], zero["id"]]
+
+
+def test_fees_can_push_merchant_negative_and_hold_payout():
+    r = settle([rec(amount="10.00"), rec(type="chargeback", amount="5.00")])
+    ln = r.line("m_1", "USD")
+    assert ln.held
+    assert ln.payout == Decimal("0.00")
+
+
+def test_only_refunds_is_held():
+    r = settle([rec(type="refund", amount="30")])
+    assert r.line("m_1", "USD").held
+```
+
+--- tests/test_adjustments.py ---
+```python
+from decimal import Decimal
+
+from settlement.fees import fee_for
+from settlement.records import parse
+from settlement.report import settle
+from tests.helpers import rec
+
+
+def test_adjustment_can_be_negative():
+    t = parse(rec(type="adjustment", amount="-12.00"))
+    assert t.amount == Decimal("-12.00")
+
+
+def test_adjustment_has_no_fee():
+    assert fee_for(parse(rec(type="adjustment", amount="25"))) == Decimal("0.00")
+
+
+def test_adjustment_shows_in_report_and_changes_payout():
+    r = settle([rec(amount="100.00"), rec(type="adjustment", amount="-10.00"), rec(type="adjustment", amount="2.50")])
+    ln = r.line("m_1", "USD")
+    assert ln.adjustments == Decimal("-7.50")
+    assert ln.payout == Decimal("89.30")
+
+
+def test_zero_adjustment_is_invalid():
+    r = settle([rec(), rec(type="adjustment", amount="0")])
+    assert len(r.errors) == 1
+```
+
+=== INTERVIEWER ONLY. Candidate: don't read below this line. ===
+
+11 of 20 tests fail at the start; 4 are test_adjustments.py (the feature).
+Bug 1, aggregate.py totals_by_merchant(): groups by (merchant_id, "ALL") instead of (merchant_id, t.currency). Every report test fails with KeyError ('m_1', 'USD'), which MASKS bugs 4 and 5 until it's fixed. Key thing to watch: does he notice five failures share one root cause, and re-run to find what was hiding behind it?
+Bug 2, fees.py fee_for(): rounds ROUND_DOWN; the spec (test name) says half-up. Fails test_sale_fee_rounds_half_up (0.735 -> 0.74).
+Bug 3, records.py parse(): `amount < 0` lets zero through; should be `<= 0`. Fails test_rejects_bad_records[over5]. Note the error message already says "must be positive".
+Bug 4, report.py settle(): `except InvalidRecord: continue` silently drops bad records; should append (e.record_id, e.reason) to report.errors. Fails test_invalid_records_are_reported_not_dropped (visible only after bug 1).
+Bug 5, report.py settle(): `held = t.gross < 0` ignores fees; should be `t.net < 0`. Fails test_fees_can_push_merchant_negative_and_hold_payout (visible only after bug 1).
+Feature: add "adjustment" to TYPES; in parse, allow negative amounts for adjustments but reject zero (other types still <= 0 rejected); fee schedule entry (0, 0); Totals.adjustments field added into gross (or net) and the _BUCKET map; Line.adjustments filled with _q(). Expected: 100 sale + (-10) + 2.50 -> adjustments -7.50, payout 89.30. test_zero_adjustment_is_invalid needs bug 4 fixed first. Good design question: should a negative adjustment be able to trigger a hold? (Yes, if hold uses net.)
+Open questions to see if he raises: can adjustments be in any currency? Should a zero adjustment be an error or ignored? Who is allowed to create adjustments (audit trail)?
+Push-back idea: "Why not just skip adjustments in parse and add them separately in settle()?"
+Follow-ups: "The job crashes halfway through a run. How do you make sure no merchant gets paid twice?" "A merchant says their payout is off by a cent. How do you debug it?" "This runs on 10 million records a day. What changes?"
