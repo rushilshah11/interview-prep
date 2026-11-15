@@ -15,5 +15,7 @@ def refill(bucket: Bucket, now: float) -> None:
     elapsed = now - bucket.updated
     if elapsed <= 0:
         return
-    bucket.tokens = bucket.tokens + int(elapsed) * bucket.refill_per_sec
+
+    
+    bucket.tokens = min(bucket.capacity, bucket.tokens + float(elapsed) * bucket.refill_per_sec)
     bucket.updated = now
