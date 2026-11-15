@@ -19,6 +19,7 @@ class Line:
     fees: Decimal
     payout: Decimal
     held: bool
+    adjustments: Decimal
 
 
 @dataclass
@@ -27,6 +28,7 @@ class Report:
     errors: list[tuple[str, str]] = field(default_factory=list)
 
     def line(self, merchant_id: str, currency: str) -> Line:
+        """Return the report line for a merchant/currency pair, raising KeyError if absent."""
         for ln in self.lines:
             if (ln.merchant_id, ln.currency) == (merchant_id, currency):
                 return ln
@@ -34,20 +36,23 @@ class Report:
 
 
 def _q(d: Decimal) -> Decimal:
+    """Round a Decimal to the nearest cent, half up."""
     return d.quantize(CENT, rounding=ROUND_HALF_UP)
 
 
 def settle(raw_records: list[dict]) -> Report:
+    """Parse raw records and build a settlement report with one payout line per merchant/currency."""
     report = Report()
     txns = []
     for raw in raw_records:
         try:
             txns.append(parse(raw))
-        except InvalidRecord:
+        except InvalidRecord as e:
+            report.errors.append((e.record_id, e.reason))
             continue
 
     for (merchant, currency), t in sorted(totals_by_merchant(txns).items()):
-        held = t.gross < 0
+        held = t.net < 0
         report.lines.append(
             Line(
                 merchant_id=merchant,
@@ -58,6 +63,7 @@ def settle(raw_records: list[dict]) -> Report:
                 fees=_q(t.fees),
                 payout=Decimal("0.00") if held else _q(t.net),
                 held=held,
+                adjustments=_q(t.adjustments)
             )
         )
     return report
